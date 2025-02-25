@@ -22,11 +22,11 @@ const SendData = struct {
 };
 
 const Event = union(enum) {
-    ACCEPT,
+    ACCEPT: void,
     RECV: RecvData,
     SEND: SendData,
     SEND_LAST: i32,
-    CLOSE,
+    CLOSE: void,
 
     fn freeData(self: *Event, allocator: Allocator) void {
         switch (self.*) {
@@ -114,34 +114,41 @@ pub fn main() !void {
                     _ = try ring.recv(@intFromPtr(newEvent), client_fd, .{ .buffer = buffer }, 0);
                 },
 
-                .RECV => |data| {
-                    const nread: usize = @intCast(cqe.res);
+                .RECV => |data| switch (cqe.err()) {
+                    .SUCCESS => {
+                        const nread: usize = @intCast(cqe.res);
 
-                    if (nread <= 1) {
+                        if (nread <= 1) {
+                            allocator.free(data.buffer);
+
+                            event.* = .{ .SEND_LAST = data.fd };
+                            _ = try ring.send(@intFromPtr(event), data.fd, "Goodbye!", 0);
+
+                            continue;
+                        }
+
+                        std.debug.print(
+                            "Received {} bytes from fd {}: '{s}'\n",
+                            .{ nread, data.fd, data.buffer[0..nread] },
+                        );
+
+                        const str = data.buffer[0..nread];
+                        const msg: []u8 = try allocator.alloc(u8, str.len);
+                        @memcpy(msg, str);
+
                         allocator.free(data.buffer);
 
-                        event.* = .{ .SEND_LAST = data.fd };
-                        _ = try ring.send(@intFromPtr(event), data.fd, "Goodbye!", 0);
+                        event.* = .{
+                            .SEND = SendData{ .fd = data.fd, .str = msg },
+                        };
 
-                        continue;
-                    }
+                        _ = try ring.send(@intFromPtr(event), data.fd, msg, 0);
+                    },
 
-                    std.debug.print(
-                        "Received {} bytes from fd {}: '{s}'\n",
-                        .{ nread, data.fd, data.buffer[0..nread] },
-                    );
-
-                    const str = data.buffer[0..nread];
-                    const msg: []u8 = try allocator.alloc(u8, str.len);
-                    @memcpy(msg, str);
-
-                    allocator.free(data.buffer);
-
-                    event.* = .{
-                        .SEND = SendData{ .fd = data.fd, .str = msg },
-                    };
-
-                    _ = try ring.send(@intFromPtr(event), data.fd, msg, 0);
+                    else => |err| std.debug.print(
+                        "Recv from fd {} returned error {s}\n",
+                        .{ data.fd, @tagName(err) },
+                    ),
                 },
 
                 .SEND => |data| {

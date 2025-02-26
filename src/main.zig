@@ -25,14 +25,13 @@ const Event = union(enum) {
     ACCEPT: void,
     RECV: RecvData,
     SEND: SendData,
-    SEND_LAST: i32,
-    CLOSE: void,
+    CLOSE: i32,
 
     fn freeData(self: *Event, allocator: Allocator) void {
         switch (self.*) {
             .RECV => |data| allocator.free(data.buffer),
             .SEND => |data| allocator.free(data.str),
-            .ACCEPT, .SEND_LAST, .CLOSE => {},
+            .ACCEPT, .CLOSE => {},
         }
     }
 };
@@ -59,28 +58,30 @@ pub fn main() !void {
     };
     try posix.sigaction(posix.SIG.INT, &sigaction, null);
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .safety = true }){};
-    defer _ = gpa.deinit();
+    var gpa_instance = std.heap.GeneralPurposeAllocator(.{ .safety = true }){};
+    defer _ = gpa_instance.deinit();
 
-    var eventPool = EventPool.init(gpa.allocator());
+    const gpa = gpa_instance.allocator();
+
+    var eventPool = EventPool.init(gpa);
     defer eventPool.deinit();
 
-    var arena = std.heap.ArenaAllocator.init(gpa.allocator());
-    defer arena.deinit();
+    var arena_instance = std.heap.ArenaAllocator.init(gpa);
+    defer arena_instance.deinit();
 
-    const allocator = arena.allocator();
+    const arena = arena_instance.allocator();
 
     var ring: IoUring = try IoUring.init(128, 0);
     defer ring.deinit();
 
-    const addr: Address = Address.initIp4(ADDRESS, PORT);
+    const server_addr: Address = Address.initIp4(ADDRESS, PORT);
 
-    std.debug.print("Starting server at {}\n", .{addr});
+    std.debug.print("Starting server at {}.\n", .{server_addr});
 
-    const server_fd: i32 = try posix.socket(linux.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
+    const server_fd: i32 = try posix.socket(linux.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, posix.IPPROTO.TCP);
     defer posix.close(server_fd);
 
-    try posix.bind(server_fd, &addr.any, addr.getOsSockLen());
+    try posix.bind(server_fd, &server_addr.any, server_addr.getOsSockLen());
 
     try posix.listen(server_fd, 10);
 
@@ -98,45 +99,60 @@ pub fn main() !void {
             const event: *Event = @ptrFromInt(cqe.user_data);
 
             switch (event.*) {
-                .ACCEPT => {
-                    _ = try ring.accept(@intFromPtr(&acceptEvent), server_fd, null, null, 0);
+                .ACCEPT => switch (cqe.err()) {
+                    .SUCCESS => {
+                        _ = try ring.accept(@intFromPtr(&acceptEvent), server_fd, null, null, 0);
 
-                    std.debug.print("Client connected\n", .{});
+                        const fd: i32 = cqe.res;
 
-                    const newEvent: *Event = try eventPool.create();
+                        var sockaddr: posix.sockaddr = undefined;
+                        var sockaddr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+                        try posix.getpeername(fd, &sockaddr, &sockaddr_len);
 
-                    const client_fd: i32 = cqe.res;
-                    const buffer: []u8 = try allocator.alloc(u8, BUFFER_SIZE);
-                    newEvent.* = .{
-                        .RECV = RecvData{ .fd = client_fd, .buffer = buffer },
-                    };
+                        const addr: std.net.Address = std.net.Address.initPosix(@alignCast(&sockaddr));
 
-                    _ = try ring.recv(@intFromPtr(newEvent), client_fd, .{ .buffer = buffer }, 0);
+                        const newEvent: *Event = try eventPool.create();
+                        const buffer: []u8 = try arena.alloc(u8, BUFFER_SIZE);
+                        newEvent.* = .{
+                            .RECV = RecvData{ .fd = fd, .buffer = buffer },
+                        };
+
+                        std.debug.print("Client connected. Opened fd {} @ {}.\n", .{ fd, addr });
+
+                        _ = try ring.recv(@intFromPtr(newEvent), fd, .{ .buffer = buffer }, 0);
+                    },
+
+                    else => |err| std.debug.print(
+                        "Accept returned error {s}.\n",
+                        .{@tagName(err)},
+                    ),
                 },
 
                 .RECV => |data| switch (cqe.err()) {
                     .SUCCESS => {
                         const nread: usize = @intCast(cqe.res);
 
-                        if (nread <= 1) {
-                            allocator.free(data.buffer);
+                        if (nread < 1) {
+                            arena.free(data.buffer);
 
-                            event.* = .{ .SEND_LAST = data.fd };
-                            _ = try ring.send(@intFromPtr(event), data.fd, "Goodbye!", 0);
+                            event.* = .{
+                                .CLOSE = data.fd,
+                            };
+                            _ = try ring.close(@intFromPtr(event), data.fd);
 
                             continue;
                         }
 
                         std.debug.print(
-                            "Received {} bytes from fd {}: '{s}'\n",
+                            "Received {} bytes from fd {}: '{s}'.\n",
                             .{ nread, data.fd, data.buffer[0..nread] },
                         );
 
                         const str = data.buffer[0..nread];
-                        const msg: []u8 = try allocator.alloc(u8, str.len);
+                        const msg: []u8 = try arena.alloc(u8, str.len);
                         @memcpy(msg, str);
 
-                        allocator.free(data.buffer);
+                        arena.free(data.buffer);
 
                         event.* = .{
                             .SEND = SendData{ .fd = data.fd, .str = msg },
@@ -145,35 +161,62 @@ pub fn main() !void {
                         _ = try ring.send(@intFromPtr(event), data.fd, msg, 0);
                     },
 
-                    else => |err| std.debug.print(
-                        "Recv from fd {} returned error {s}\n",
-                        .{ data.fd, @tagName(err) },
-                    ),
+                    else => |err| {
+                        std.debug.print(
+                            "Recv from fd {} returned error {s}.\n",
+                            .{ data.fd, @tagName(err) },
+                        );
+
+                        arena.free(data.buffer);
+
+                        event.* = .{
+                            .CLOSE = data.fd,
+                        };
+                        _ = try ring.close(@intFromPtr(event), data.fd);
+                    },
                 },
 
-                .SEND => |data| {
-                    std.debug.print("{} bytes written.\n", .{cqe.res});
+                .SEND => |data| switch (cqe.err()) {
+                    .SUCCESS => {
+                        std.debug.print("{} bytes written to fd {}.\n", .{ cqe.res, data.fd });
 
-                    allocator.free(data.str);
+                        arena.free(data.str);
 
-                    const buffer: []u8 = try allocator.alloc(u8, BUFFER_SIZE);
-                    event.* = .{
-                        .RECV = RecvData{ .fd = data.fd, .buffer = buffer },
-                    };
+                        const buffer: []u8 = try arena.alloc(u8, BUFFER_SIZE);
+                        event.* = .{
+                            .RECV = RecvData{ .fd = data.fd, .buffer = buffer },
+                        };
 
-                    _ = try ring.recv(@intFromPtr(event), data.fd, .{ .buffer = buffer }, 0);
+                        _ = try ring.recv(@intFromPtr(event), data.fd, .{ .buffer = buffer }, 0);
+                    },
+
+                    else => |err| {
+                        std.debug.print(
+                            "Send to fd {} returned error {s}.\n",
+                            .{ data.fd, @tagName(err) },
+                        );
+
+                        arena.free(data.str);
+
+                        event.* = .{
+                            .CLOSE = data.fd,
+                        };
+                        _ = try ring.close(@intFromPtr(event), data.fd);
+                    },
                 },
 
-                .SEND_LAST => |fd| {
-                    std.debug.print("{} bytes written.\n", .{cqe.res});
-                    event.* = .CLOSE;
-                    _ = try ring.close(@intFromPtr(event), fd);
-                },
-
-                .CLOSE => {
-                    std.debug.print("Client disconnected\n", .{});
-                    event.freeData(allocator);
+                .CLOSE => |fd| {
+                    event.freeData(arena);
                     eventPool.destroy(event);
+
+                    switch (cqe.err()) {
+                        .SUCCESS => std.debug.print("Client disconnected. Closed fd {}.\n", .{fd}),
+
+                        else => |err| std.debug.print(
+                            "Close fd {} returned error {s}.\n",
+                            .{ fd, @tagName(err) },
+                        ),
+                    }
                 },
             }
         }

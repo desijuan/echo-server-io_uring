@@ -11,6 +11,11 @@ const BUFFER_SIZE = 512;
 const ADDRESS = [4]u8{ 127, 0, 0, 1 };
 const PORT = 8080;
 
+const Sock = struct {
+    addr: posix.sockaddr,
+    addr_len: posix.socklen_t,
+};
+
 const RecvData = struct {
     fd: i32,
     buffer: []u8,
@@ -22,7 +27,7 @@ const SendData = struct {
 };
 
 const Event = union(enum) {
-    ACCEPT: void,
+    ACCEPT: Sock,
     RECV: RecvData,
     SEND: SendData,
     CLOSE: i32,
@@ -45,9 +50,12 @@ inline fn serverShouldExit() bool {
 }
 
 fn sig_handler(sig: c_int) callconv(.C) void {
-    if (sig == posix.SIG.INT) {
+    if (sig == posix.SIG.INT)
         server_should_exit.store(true, .monotonic);
-    }
+}
+
+inline fn printInfo(T: type) void {
+    std.debug.print("{s} size: {}, align: {}\n", .{ @typeName(T), @sizeOf(T), @alignOf(T) });
 }
 
 pub fn main() !void {
@@ -85,8 +93,10 @@ pub fn main() !void {
 
     try posix.listen(server_fd, 10);
 
-    const acceptEvent: Event = .ACCEPT;
-    _ = try ring.accept(@intFromPtr(&acceptEvent), server_fd, null, null, 0);
+    var acceptEvent: Event = .{
+        .ACCEPT = Sock{ .addr = undefined, .addr_len = @sizeOf(posix.sockaddr) },
+    };
+    _ = try ring.accept(@intFromPtr(&acceptEvent), server_fd, &acceptEvent.ACCEPT.addr, &acceptEvent.ACCEPT.addr_len, 0);
 
     while (!serverShouldExit()) {
         _ = ring.submit_and_wait(1) catch |err| switch (err) {
@@ -99,25 +109,29 @@ pub fn main() !void {
             const event: *Event = @ptrFromInt(cqe.user_data);
 
             switch (event.*) {
-                .ACCEPT => switch (cqe.err()) {
+                .ACCEPT => |sock| switch (cqe.err()) {
                     .SUCCESS => {
-                        _ = try ring.accept(@intFromPtr(&acceptEvent), server_fd, null, null, 0);
+                        const addr: std.net.Address = std.net.Address.initPosix(@alignCast(&sock.addr));
+
+                        acceptEvent.ACCEPT.addr_len = @sizeOf(posix.sockaddr);
+
+                        _ = try ring.accept(
+                            @intFromPtr(&acceptEvent),
+                            server_fd,
+                            &acceptEvent.ACCEPT.addr,
+                            &acceptEvent.ACCEPT.addr_len,
+                            0,
+                        );
 
                         const fd: i32 = cqe.res;
 
-                        var sockaddr: posix.sockaddr = undefined;
-                        var sockaddr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-                        try posix.getpeername(fd, &sockaddr, &sockaddr_len);
-
-                        const addr: std.net.Address = std.net.Address.initPosix(@alignCast(&sockaddr));
+                        std.debug.print("Client connected. Opened fd {} @ {}.\n", .{ fd, addr });
 
                         const newEvent: *Event = try eventPool.create();
                         const buffer: []u8 = try arena.alloc(u8, BUFFER_SIZE);
                         newEvent.* = .{
                             .RECV = RecvData{ .fd = fd, .buffer = buffer },
                         };
-
-                        std.debug.print("Client connected. Opened fd {} @ {}.\n", .{ fd, addr });
 
                         _ = try ring.recv(@intFromPtr(newEvent), fd, .{ .buffer = buffer }, 0);
                     },
